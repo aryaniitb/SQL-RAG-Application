@@ -1,0 +1,222 @@
+import streamlit as st
+import re
+import faiss
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from sqlalchemy import create_engine, text, inspect
+from sentence_transformers import SentenceTransformer
+from datetime import datetime
+import pymysql
+
+# ---------------------- Setup: RAG Examples ----------------------
+RAG_DOCS = [
+    "SELECT unit_price FROM products WHERE product_id = 3;",
+    "SELECT name, unit_price FROM products ORDER BY unit_price DESC LIMIT 5;",
+    "SELECT COUNT(*) FROM products;",
+    "SELECT * FROM products WHERE quantity_in_stock > 100;",
+    "SELECT AVG(unit_price) FROM products;"
+]
+
+# ---------------------- Caching Heavy Models ----------------------
+@st.cache_resource
+def embed_examples(docs):
+    encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = encoder.encode(docs, convert_to_tensor=True, normalize_embeddings=True)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings.cpu().numpy())
+    return encoder, index
+
+@st.cache_resource
+def load_sql_model():
+    model_id = "defog/sqlcoder-7b-2"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16
+    )
+    return pipeline("text-generation", model=model, tokenizer=tokenizer,
+                    max_new_tokens=200, do_sample=False)
+
+# ---------------------- Utility Functions ----------------------
+def get_schema(engine, table):
+    cols = inspect(engine).get_columns(table)
+    return f"Table: {table}\n  - " + "\n  - ".join([f"{c['name']} ({c['type']})" for c in cols])
+
+def list_tables(engine):
+    return inspect(engine).get_table_names()
+
+def run_query(engine, query):
+    with engine.connect() as conn:
+        result = conn.execute(text(query))
+        return result.fetchall()
+
+def retrieve_examples(query, encoder, index, base, k=3):
+    vec = encoder.encode([query], convert_to_tensor=True, normalize_embeddings=True).cpu().numpy()
+    _, I = index.search(vec, k)
+    return [base[i] for i in I[0]]
+
+def generate_sql(llm, schema, question, examples):
+    prompt = f"""### Schema:
+{schema}
+
+### Examples:
+{chr(10).join(examples)}
+
+### Question:
+{question}
+
+### SQL:"""
+    out = llm(prompt)[0]['generated_text']
+    sql = re.search(r"SELECT\s+.*?;", out, re.IGNORECASE | re.DOTALL)
+    return sql.group(0).strip() if sql else "SELECT * FROM products LIMIT 5;"
+
+# ---------------------- Log to Separate MySQL DB ----------------------
+from sqlalchemy import bindparam
+
+def log_to_db(user, password, host, port, question, sql_query):
+    try:
+        # Validate non-empty values
+        if not question.strip() or not sql_query.strip():
+            st.warning("⚠️ Empty question or SQL — skipping log")
+            return
+
+        # Connect to log DB
+        log_engine = create_engine(f"mysql+pymysql://{user}:{password}@{host}:{port}/sql_logs")
+
+        with log_engine.begin() as conn:
+            # Ensure table exists
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS query_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    generated_sql TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+
+            # Proper parameterized insert using bindparam
+            insert_stmt = text("""
+                INSERT INTO query_logs (question, generated_sql)
+                VALUES (:question, :sql_query);
+            """).bindparams(
+                bindparam("question", type_=str),
+                bindparam("sql_query", type_=str)
+            )
+
+            conn.execute(insert_stmt, {"question": question, "sql_query": sql_query})
+
+    except Exception as e:
+        st.error(f"❌ Logging to database failed: {e}")
+
+# ---------------------- Streamlit UI ----------------------
+st.set_page_config(page_title="SQL Chatbot", page_icon="🤖", layout="wide")
+st.title("🧠 RAG-based SQL Chatbot")
+
+# Initialize session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+    st.session_state.db_connected = False
+    st.session_state.table_selected = False
+    st.session_state.model_loaded = False
+
+# ---------------------- Sidebar: DB Configuration ----------------------
+with st.sidebar:
+    st.header("Database Configuration")
+    with st.form("db_config"):
+        host = st.text_input("DB Host", "localhost")
+        port = st.number_input("Port", 3306)
+        user = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        db = st.text_input("DB Name")
+        submit = st.form_submit_button("Connect")
+
+        if submit:
+            conn_str = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}"
+            try:
+                engine = create_engine(conn_str)
+                engine.connect()
+                st.session_state.engine = engine
+                st.session_state.db_connected = True
+                st.success("✅ Database connected successfully!")
+
+                # Get tables
+                tables = list_tables(engine)
+                st.session_state.tables = tables
+
+            except Exception as e:
+                st.error(f"❌ Connection failed: {str(e)}")
+
+# ---------------------- Sidebar: Table Selection ----------------------
+if st.session_state.get("db_connected", False):
+    with st.sidebar:
+        if "tables" in st.session_state:
+            selected_table = st.selectbox("Select Table", st.session_state.tables)
+            if st.button("Load Table Schema"):
+                st.session_state.selected_table = selected_table
+                schema = get_schema(st.session_state.engine, selected_table)
+                st.session_state.schema = schema
+                st.session_state.table_selected = True
+                st.info(f"Schema loaded for: {selected_table}")
+
+                # Load ML components
+                with st.spinner("Loading AI models..."):
+                    st.session_state.encoder, st.session_state.index = embed_examples(RAG_DOCS)
+                    st.session_state.llm = load_sql_model()
+                    st.session_state.model_loaded = True
+                st.success("AI models loaded!")
+
+# ---------------------- Chat UI ----------------------
+if st.session_state.get("model_loaded", False):
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if "sql" in message:
+                st.code(message["sql"], language="sql")
+            if "results" in message:
+                st.dataframe(message["results"])
+
+    if prompt := st.chat_input("Ask about your data..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.spinner("Generating SQL query..."):
+            examples = retrieve_examples(
+                prompt,
+                st.session_state.encoder,
+                st.session_state.index,
+                RAG_DOCS
+            )
+            sql = generate_sql(
+                st.session_state.llm,
+                st.session_state.schema,
+                prompt,
+                examples
+            )
+
+            # ✅ Log to external DB
+            log_to_db(user, password, host, port, prompt, sql)
+
+        with st.spinner("Running query..."):
+            try:
+                results = run_query(st.session_state.engine, sql)
+            except Exception as e:
+                results = []
+                error = str(e)
+
+        with st.chat_message("assistant"):
+            if results:
+                st.success(f"Found {len(results)} records")
+                st.code(sql, language="sql")
+                st.dataframe(results)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"Found {len(results)} records",
+                    "sql": sql,
+                    "results": results
+                })
+            else:
+                st.error(f"Query failed: {error}")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"Query failed: {error}"
+                })
