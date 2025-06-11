@@ -1,0 +1,245 @@
+# # RAG-based SQL Chatbot using FAISS and TinyLlama
+# # Requirements: pip install faiss-cpu sentence-transformers pymysql sqlalchemy transformers
+
+# import os
+# import torch
+# import re
+# import getpass
+# import faiss
+# from sqlalchemy import create_engine, text, inspect
+# from sentence_transformers import SentenceTransformer
+# from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+# # === RAG SQL Examples ===
+# RAG_DOCS = [
+#     "SELECT unit_price FROM products WHERE name = 'Lettuce - Romaine, Heart';",
+#     "SELECT name, unit_price FROM products ORDER BY unit_price DESC LIMIT 5;",
+#     "SELECT COUNT(*) FROM products;",
+#     "SELECT * FROM products WHERE quantity_in_stock > 100;",
+#     "SELECT AVG(unit_price) FROM products;",
+#     "SELECT unit_price FROM products WHERE product_id = 3;",
+# ]
+
+# # === STEP 1: Embed RAG docs ===
+# def embed_examples(sentences):
+#     encoder = SentenceTransformer("all-MiniLM-L6-v2")
+#     embeddings = encoder.encode(sentences, convert_to_tensor=True, normalize_embeddings=True)
+#     index = faiss.IndexFlatIP(embeddings.shape[1])
+#     index.add(embeddings.cpu().numpy())
+#     return encoder, index
+
+# # === STEP 2: Retrieve similar examples ===
+# def retrieve_similar_examples(query, encoder, index, base_sentences, k=3):
+#     query_vec = encoder.encode([query], convert_to_tensor=True, normalize_embeddings=True).cpu().numpy()
+#     _, I = index.search(query_vec, k)
+#     return [base_sentences[i] for i in I[0]]
+
+# # === STEP 3: Get DB connection config ===
+# def get_db_config():
+#     print("\n" + "=" * 50)
+#     print("DATABASE CONFIGURATION")
+#     print("=" * 50)
+#     host = input("Enter database host [localhost]: ") or "localhost"
+#     port = input("Enter port [3306]: ") or "3306"
+#     user = input("Enter username: ")
+#     password = getpass.getpass("Enter password: ")
+#     database = input("Enter database name: ")
+#     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+# # === STEP 4: Load LLM ===
+# def load_llm():
+#     print("\nLoading TinyLlama model...")
+#     model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+#     tokenizer = AutoTokenizer.from_pretrained(model_id)
+#     model = AutoModelForCausalLM.from_pretrained(model_id)
+#     return pipeline("text-generation", model=model, tokenizer=tokenizer,
+#                     max_new_tokens=200, do_sample=True, temperature=0.7,
+#                     pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)
+
+# # === STEP 5: Create prompt and extract SQL ===
+# def generate_sql(llm, schema, user_question, examples):
+#     prompt = f"""
+# You are an expert SQL assistant. Given the schema and past examples, write ONLY a valid MySQL SELECT query.
+
+# ### Schema:
+# {schema}
+
+# ### Examples:
+# {chr(10).join(examples)}
+
+# ### Question:
+# {user_question}
+
+# ### SQL:
+# """.strip()
+
+#     raw_output = llm(prompt)[0]['generated_text']
+#     # Extract valid SELECT SQL query only
+#     match = re.search(r"(SELECT\s.*?;)", raw_output, re.IGNORECASE | re.DOTALL)
+#     if match:
+#         return match.group(1).strip()
+#     else:
+#         lines = raw_output.splitlines()
+#         for line in lines:
+#             if line.strip().upper().startswith("SELECT"):
+#                 return line.strip()
+#         return raw_output.strip()
+
+# # === STEP 6: DB Utils ===
+# def list_tables(engine):
+#     return inspect(engine).get_table_names()
+
+# def get_schema(engine, table):
+#     columns = inspect(engine).get_columns(table)
+#     return f"Table: {table}\n  - " + "\n  - ".join([f"{col['name']} ({col['type']})" for col in columns])
+
+# def run_query(engine, query):
+#     if any(word in query.upper() for word in ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER"]):
+#         raise ValueError(" Unsafe query blocked.")
+#     with engine.connect() as conn:
+#         result = conn.execute(text(query))
+#         return result.fetchall()
+
+# # === MAIN FUNCTION ===
+# if __name__ == "__main__":
+#     try:
+#         conn_str = get_db_config()
+#         engine = create_engine(conn_str)
+#         with engine.connect():
+#             print(" Database connected successfully.")
+
+#         table = input("Enter table name: ").strip()
+#         if table not in list_tables(engine):
+#             print(" Table not found.")
+#             exit()
+
+#         schema = get_schema(engine, table)
+#         llm = load_llm()
+#         encoder, index = embed_examples(RAG_DOCS)
+
+#         while True:
+#             user_question = input("\n💬 You: ").strip()
+#             if user_question.lower() == "exit":
+#                 break
+#             examples = retrieve_similar_examples(user_question, encoder, index, RAG_DOCS)
+#             sql = generate_sql(llm, schema, user_question, examples)
+#             print(f"\n SQL Query:\n{sql}")
+#             try:
+#                 result = run_query(engine, sql)
+#                 print(f"\n Result:\n{result[:5]}")
+#             except Exception as e:
+#                 print(f" Query error: {e}")
+
+#     except Exception as fatal_err:
+#         print(f" Fatal error: {fatal_err}")
+# Final SQL Chatbot with real query execution
+import re
+import getpass
+import faiss
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from sqlalchemy import create_engine, text, inspect
+from sentence_transformers import SentenceTransformer
+
+# Setup: Examples for RAG
+RAG_DOCS = [
+    "SELECT unit_price FROM products WHERE product_id = 3;",
+    "SELECT name, unit_price FROM products ORDER BY unit_price DESC LIMIT 5;",
+    "SELECT COUNT(*) FROM products;",
+    "SELECT * FROM products WHERE quantity_in_stock > 100;",
+    "SELECT AVG(unit_price) FROM products;"
+]
+
+# Step 1: Embed examples
+def embed_examples(docs):
+    encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = encoder.encode(docs, convert_to_tensor=True, normalize_embeddings=True)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings.cpu().numpy())
+    return encoder, index
+
+# Step 2: Retrieve top-k examples
+def retrieve_examples(query, encoder, index, base, k=3):
+    vec = encoder.encode([query], convert_to_tensor=True, normalize_embeddings=True).cpu().numpy()
+    _, I = index.search(vec, k)
+    return [base[i] for i in I[0]]
+
+# Step 3: DB Config
+def get_db_config():
+    host = input("DB Host [localhost]: ") or "localhost"
+    port = input("Port [3306]: ") or "3306"
+    user = input("Username: ")
+    password = getpass.getpass("Password: ")
+    db = input("DB Name: ")
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}"
+
+# Step 4: Load SQLCoder
+def load_sql_model():
+    model_id = "defog/sqlcoder-7b-2"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16)
+    return pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=200, do_sample=False)
+
+# Step 5: Generate SQL
+def generate_sql(llm, schema, question, examples):
+    prompt = f"""### Schema:
+{schema}
+
+### Examples:
+{chr(10).join(examples)}
+
+### Question:
+{question}
+
+### SQL:"""
+    out = llm(prompt)[0]['generated_text']
+    sql = re.search(r"SELECT\s+.*?;", out, re.IGNORECASE | re.DOTALL)
+    return sql.group(0).strip() if sql else "SELECT * FROM products LIMIT 5;"
+
+# DB Functions
+def get_schema(engine, table):
+    cols = inspect(engine).get_columns(table)
+    return f"Table: {table}\n  - " + "\n  - ".join([f"{c['name']} ({c['type']})" for c in cols])
+
+def list_tables(engine):
+    return inspect(engine).get_table_names()
+
+def run_query(engine, query):
+    with engine.connect() as conn:
+        result = conn.execute(text(query))
+        return result.fetchall()
+
+# Main
+if __name__ == "__main__":
+    try:
+        conn_str = get_db_config()
+        engine = create_engine(conn_str)
+        engine.connect()
+        print(" Connected.")
+
+        table = input("Enter table name: ").strip()
+        if table not in list_tables(engine):
+            print(" Invalid table.")
+            exit()
+
+        schema = get_schema(engine, table)
+        llm = load_sql_model()
+        encoder, index = embed_examples(RAG_DOCS)
+
+        while True:
+            question = input("\n💬 You: ").strip()
+            if question.lower() == "exit":
+                break
+
+            examples = retrieve_examples(question, encoder, index, RAG_DOCS)
+            sql = generate_sql(llm, schema, question, examples)
+            print(f"\n SQL Query:\n{sql}")
+            try:
+                result = run_query(engine, sql)
+                print("\n Query Result:")
+                for row in result:
+                    print(row)
+            except Exception as e:
+                print(f"⚠ SQL Error: {e}")
+    except Exception as e:
+        print(f" Fatal: {e}")
